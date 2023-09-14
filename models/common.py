@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
+import torch.nn.functional as F
+from typing import Optional, Tuple, Type
 
 # Import 'ultralytics' package or install if if missing
 try:
@@ -322,6 +324,141 @@ class Concat(nn.Module):
 
     def forward(self, x):
         return torch.cat(x, self.d)
+
+
+class PatchEmbed(nn.Module): 
+    def __init__(
+        self,
+        kernel_size: Tuple[int, int] = (16, 16),
+        stride: Tuple[int, int] = (16, 16),
+        padding: Tuple[int, int] = (0, 0),
+        in_chans: int = 3,
+        embed_dim: int = 768,
+    ) -> None:
+        super().__init__()
+
+        self.proj = nn.Conv2d(
+            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        # B C H W -> B H W C
+        x = x.permute(0, 2, 3, 1)
+        return x
+
+
+class Attention(nn.Module): 
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.wq = nn.Linear(dim, dim, bias=qkv_bias)
+        self.wk = nn.Linear(dim, dim, bias=qkv_bias)
+        self.wv = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+    
+    def _reshape_to_heads(self, x): 
+        batch_size, seq_len, embed_dim = x.size()
+        assert embed_dim == self.dim
+        sub_dim = embed_dim // self.num_heads
+        return x.view(batch_size, seq_len, self.num_heads, sub_dim).transpose(1, 2)
+    
+    def _reshape_from_heads(self, x): 
+        batch_size, n_head, seq_len, sub_dim = x.size()
+        assert n_head == self.num_heads
+        out_dim = sub_dim * n_head
+        assert out_dim == self.dim
+        return x.transpose(1, 2).contiguous().view(batch_size, seq_len, out_dim)
+    
+    def forward(self, q, k, v):
+        # q -> (B, q_seq_len, C)
+        # k -> (B, kv_seq_len, C)
+        # v -> (B, kv_seq_len, C)
+        q = self._reshape_to_heads(self.wq(q)) # (B, nh, q_seq_len, sub_dim)
+        k = self._reshape_to_heads(self.wk(k)) # (B, nh, kv_seq_len, sub_dim)
+        v = self._reshape_to_heads(self.wv(v)) # (B, nh, kv_seq_len, sub_dim)
+
+        # self-attend: (B, nh, q_seq_len, sub_dim) x (B, nh, sub_dim, kv_seq_len) -> (B, nh, q_seq_len, kv_seq_len)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        y = attn @ v # (B, nh, q_seq_len, kv_seq_len) x (B, nh, kv_seq_len, sub_dim) -> (B, nh, q_seq_len, sub_dim)
+        y = self._reshape_from_heads(y) # re-assemble all head outputs side by side
+        # y -> (B, q_seq_len, C)
+
+        y = self.proj_drop(self.proj(y))
+        return y
+
+
+class CrossAttention(nn.Module): 
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+
+        self.resized_img_size = 10
+        img_anchors = (self.resized_img_size, self.resized_img_size)
+        self.avgpool_q = nn.AdaptiveAvgPool2d(img_anchors)
+        self.avgpool_k = nn.AdaptiveAvgPool2d(img_anchors)
+
+        self.dim = dim
+        # self.patch_size = 8
+        # self.embed_dim = 768
+        # self.patch_embed_q = PatchEmbed(
+        #     kernel_size=(self.patch_size, self.patch_size),
+        #     stride=(self.patch_size, self.patch_size), 
+        #     in_chans=self.dim, 
+        #     embed_dim=self.embed_dim
+        # )
+        # self.patch_embed_k = PatchEmbed(
+        #     kernel_size=(self.patch_size, self.patch_size),
+        #     stride=(self.patch_size, self.patch_size),
+        #     in_chans=self.dim, 
+        #     embed_dim=self.embed_dim
+        # )
+
+        self.attention = Attention(dim, num_heads, qkv_bias, qk_scale, attn_drop, proj_drop)
+        
+    def forward(self, x): 
+        """
+            x : [u1, u2]
+            u1 is coming from the last layer and going to construct k, v
+            u2 is coming from previous layers and going to construct q
+            u1 -> (B, C, H1, W1)
+            u2 -> (B, C, H2, W2)
+            out -> (B, 2*C, H2, W2)
+        """
+        u1, u2 = x
+        B, C, H, W = u2.shape
+        assert C == self.dim
+
+        initial_input = u2.clone()
+        u1 = self.avgpool_k(u1) # u1 -> (B, C, S, S)
+        u2 = self.avgpool_q(u2) # u2 -> (B, C, S, S)
+        u1 = u1.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
+        u2 = u2.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
+        # u1=u2 -> (B, S*S, C)
+
+        # # u1-u2 -> (B, PS, PS, embed_dim) -> (B, PS*PS, embed_dim)
+        # u1 = self.patch_embed_k(u1).contiguous().view(B, -1, self.embed_dim) 
+        # u2 = self.patch_embed_q(u2).contiguous().view(B, -1, self.embed_dim)
+        # y = self.attention(q=u2, k=u1, v=u1) # y -> (B, PS*PS, embed_dim)
+        # y = y.transpose(1, 2).contiguous().view(B, C, self.patch_size, self.patch_size) # y -> (B, embed_dim, PS, PS)
+
+        y = self.attention(q=u2, k=u1, v=u1) # y -> (B, S*S, C)
+        y = y.transpose(1, 2).contiguous().view(B, C, self.resized_img_size, self.resized_img_size) # y -> (B, C, S, S)
+        
+        y = nn.Upsample(size=(H, W), mode="bilinear")(y) # y -> (B, C, H, W) 
+        y = torch.cat([initial_input, y], dim=1)
+
+        return y
+
 
 
 class DetectMultiBackend(nn.Module):

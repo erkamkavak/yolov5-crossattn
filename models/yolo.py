@@ -329,6 +329,15 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is CrossAttention: 
+            layers_to_attend = f
+            if len(layers_to_attend) != 2 and ch[layers_to_attend[0]] != ch[layers_to_attend[1]]: 
+                raise Exception("Arguments for cross attention are incorrect")
+
+            c1, c2 = ch[layers_to_attend[0]], args[0]
+            if c2 != no: 
+                c2 = make_divisible(c2 * gw, 8)
+            args = [c1]
         # TODO: channel, gw, gd
         elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
