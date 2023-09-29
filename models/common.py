@@ -326,28 +326,6 @@ class Concat(nn.Module):
         return torch.cat(x, self.d)
 
 
-class PatchEmbed(nn.Module): 
-    def __init__(
-        self,
-        kernel_size: Tuple[int, int] = (16, 16),
-        stride: Tuple[int, int] = (16, 16),
-        padding: Tuple[int, int] = (0, 0),
-        in_chans: int = 3,
-        embed_dim: int = 768,
-    ) -> None:
-        super().__init__()
-
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=stride, padding=padding
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        # B C H W -> B H W C
-        x = x.permute(0, 2, 3, 1)
-        return x
-
-
 class Attention(nn.Module): 
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -398,33 +376,75 @@ class Attention(nn.Module):
         return y
 
 
+def pad_if_required(x, scale_factor):
+    """
+    Add padding to the image x if it is not divisible by scale_factor 
+    """ 
+    B, C, H, W = x.shape
+
+    pad_h = (scale_factor - H % scale_factor) % scale_factor
+    pad_w = (scale_factor - W % scale_factor) % scale_factor
+
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, pad_w, 0, pad_h, 0, 0))
+
+    return x, (pad_h, pad_w)
+
+def remove_pad(x, pad_to_remove): 
+    H, W = pad_to_remove
+    x = x[:, :, :H, :W].contiguous()
+    return x
+
+class PSDownsampling(nn.Module): 
+    def __init__(self, channel, scale_factor=2): 
+        super(PSDownsampling, self).__init__()
+        self.scale_factor = scale_factor
+        self.pixel_unshuffle = nn.PixelUnshuffle(scale_factor) 
+        self.compression = nn.Conv2d(channel * scale_factor**2, channel, kernel_size=(1, 1), stride=(1, 1))
+
+    def forward(self, x): 
+        # x, added_pad = pad_if_required(x, self.scale_factor)
+        x = self.pixel_unshuffle(x) # B, C * scale_factor**2, H//scale_factor, W//scale_factor 
+        x = self.compression(x) # B, C, H // scale_factor, W // scale_factor
+        return x
+
+
+class PSUpsampling(nn.Module): 
+    def __init__(self, channel, scale_factor=2): 
+        super(PSUpsampling, self).__init__()
+        self.scale_factor = scale_factor
+        self.expansion = nn.Conv2d(channel, channel * scale_factor**2, kernel_size=(1, 1), stride=(1, 1))
+        self.pixel_shuffle = nn.PixelShuffle(scale_factor) 
+
+    def forward(self, x, previously_added_pad = None):
+        x = self.expansion(x) # B, C * scale_factor**2, H, W
+        x = self.pixel_shuffle(x) # B, C, H * scale_factor, W * scale_factor 
+        # if previously_added_pad is not None or previously_added_pad != (0, 0): 
+        #     remove_pad(x, previously_added_pad) 
+        return x
+
 class CrossAttention(nn.Module): 
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, q_size_ratio, k_size_ratio, num_heads=8, qkv_bias=False, qk_scale=None, 
+                 attn_drop=0., proj_drop=0., resid_pdrop=0.1):
         super().__init__()
-
-        self.resized_img_size = 10
-        img_anchors = (self.resized_img_size, self.resized_img_size)
-        self.avgpool_q = nn.AdaptiveAvgPool2d(img_anchors)
-        self.avgpool_k = nn.AdaptiveAvgPool2d(img_anchors)
-
         self.dim = dim
-        # self.patch_size = 8
-        # self.embed_dim = 768
-        # self.patch_embed_q = PatchEmbed(
-        #     kernel_size=(self.patch_size, self.patch_size),
-        #     stride=(self.patch_size, self.patch_size), 
-        #     in_chans=self.dim, 
-        #     embed_dim=self.embed_dim
-        # )
-        # self.patch_embed_k = PatchEmbed(
-        #     kernel_size=(self.patch_size, self.patch_size),
-        #     stride=(self.patch_size, self.patch_size),
-        #     in_chans=self.dim, 
-        #     embed_dim=self.embed_dim
-        # )
+        self.resized_img_ratio = 32
+        
+        self.q_scale_factor = self.resized_img_ratio // q_size_ratio
+        self.k_scale_factor = self.resized_img_ratio // k_size_ratio
+
+        self.resized_img_size = 40 
+        img_size = (self.resized_img_size, self.resized_img_size)
+        self.q_downsample = nn.AdaptiveAvgPool2d(img_size)
+        self.k_downsample = nn.AdaptiveAvgPool2d(img_size)
+
+        # self.q_downsample = PSDownsampling(self.dim, self.q_scale_factor)
+        # self.k_downsample = PSDownsampling(self.dim, self.k_scale_factor)
+        # #final upsampling, should have the same factor as q
+        # self.upsample = PSUpsampling(self.dim, self.q_scale_factor)
 
         self.attention = Attention(dim, num_heads, qkv_bias, qk_scale, attn_drop, proj_drop)
-        
+
     def forward(self, x): 
         """
             x : [u1, u2]
@@ -433,32 +453,80 @@ class CrossAttention(nn.Module):
             u1 -> (B, C, H1, W1)
             u2 -> (B, C, H2, W2)
             out -> (B, 2*C, H2, W2)
-        """
+        """            
         u1, u2 = x
         B, C, H, W = u2.shape
         assert C == self.dim
-
+        
         initial_input = u2.clone()
-        u1 = self.avgpool_k(u1) # u1 -> (B, C, S, S)
-        u2 = self.avgpool_q(u2) # u2 -> (B, C, S, S)
+        u1 = self.q_downsample(u1) # u1 -> (B, C, S, S)
+        u2 = self.k_downsample(u2) # u2 -> (B, C, S, S)
         u1 = u1.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
         u2 = u2.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
         # u1=u2 -> (B, S*S, C)
 
-        # # u1-u2 -> (B, PS, PS, embed_dim) -> (B, PS*PS, embed_dim)
-        # u1 = self.patch_embed_k(u1).contiguous().view(B, -1, self.embed_dim) 
-        # u2 = self.patch_embed_q(u2).contiguous().view(B, -1, self.embed_dim)
-        # y = self.attention(q=u2, k=u1, v=u1) # y -> (B, PS*PS, embed_dim)
-        # y = y.transpose(1, 2).contiguous().view(B, C, self.patch_size, self.patch_size) # y -> (B, embed_dim, PS, PS)
+        y = self.attention(q=u1, k=u2, v=u2) # y -> (B, S*S, C)
+        resized_img_size = int(math.sqrt(y.shape[1]))
+        y = y.transpose(1, 2).contiguous().view(B, C, resized_img_size, resized_img_size) # y -> (B, C, S, S)
 
-        y = self.attention(q=u2, k=u1, v=u1) # y -> (B, S*S, C)
-        y = y.transpose(1, 2).contiguous().view(B, C, self.resized_img_size, self.resized_img_size) # y -> (B, C, S, S)
-        
-        y = nn.Upsample(size=(H, W), mode="bilinear")(y) # y -> (B, C, H, W) 
+        y = nn.Upsample(size=(H, W), mode="bilinear")(y)
+        # y = self.upsample(y, size=(H, W)) # y -> (B, C, H, W) 
         y = torch.cat([initial_input, y], dim=1)
 
         return y
 
+
+class CrossAttentionV2(nn.Module): 
+    def __init__(self, dim, q_size_ratio, k_size_ratio, num_heads=8, qkv_bias=False, qk_scale=None, 
+                 attn_drop=0., proj_drop=0., resid_pdrop=0.1):
+        super().__init__()
+        self.dim = dim
+        self.resized_img_ratio = 64
+        
+        self.scale_factor = min(self.resized_img_ratio // q_size_ratio, self.resized_img_ratio // k_size_ratio)
+
+        self.resized_img_size = 20 
+        img_size = (self.resized_img_size, self.resized_img_size)
+        # self.q_downsample = nn.AdaptiveAvgPool2d(img_size)
+        # self.k_downsample = nn.AdaptiveAvgPool2d(img_size)
+
+        # self.q_downsample = PSDownsampling(self.dim, self.scale_factor)
+        # self.k_downsample = PSDownsampling(self.dim, self.scale_factor)
+        #final upsampling, should have the same factor as q
+        # self.upsample = PSUpsampling(self.dim, self.scale_factor)
+
+        self.attention = Attention(self.dim, num_heads, qkv_bias, qk_scale, attn_drop, proj_drop)
+
+    def forward(self, x): 
+        """
+            x : [u1, u2]
+            u1 is coming from the last layer and going to construct k, v
+            u2 is coming from previous layers and going to construct q
+            u1 -> (B, C, H1, W1)
+            u2 -> (B, C, H2, W2)
+            out -> (B, 2*C, H2, W2)
+        """            
+        u1, u2 = x
+        B, C, H, W = u2.shape
+        H2, W2 = u1.shape[2:4]
+        
+        initial_input = u2.clone()
+        u1 = nn.AdaptiveAvgPool2d((H2 // self.scale_factor, W2 // self.scale_factor))(u1)
+        u2 = nn.AdaptiveAvgPool2d((H // self.scale_factor, W // self.scale_factor))(u2)
+        # u1 = self.k_downsample(u1) # u1 -> (B, C, S, S)
+        # u2 = self.q_downsample(u2) # u2 -> (B, C, S, S)
+        u1 = u1.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
+        u2 = u2.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
+        # u1=u2 -> (B, S*S, C)
+
+        y = self.attention(q=u2, k=u1, v=u1) # y -> (B, S*S, C)
+        y = y.transpose(1, 2).contiguous().view(B, C, H // self.scale_factor, W // self.scale_factor) # y -> (B, C, S, S)
+
+        y = nn.Upsample(size=(H, W), mode="bilinear")(y)
+        # y = self.upsample(y) # y -> (B, C, H, W) 
+        y += initial_input
+
+        return y
 
 
 class DetectMultiBackend(nn.Module):
