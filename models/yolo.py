@@ -329,7 +329,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {CrossAttention, CrossAttentionV2}: 
+        elif m in {CrossAttention, CrossAttentionV2, CBAMCrossAttn}: 
             layers_to_attend = f
             if len(layers_to_attend) != 2 and ch[layers_to_attend[0]] != ch[layers_to_attend[1]]: 
                 raise Exception("Arguments for cross attention are incorrect")

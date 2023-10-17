@@ -485,10 +485,21 @@ class CrossAttentionV2(nn.Module):
         
         self.scale_factor = min(self.resized_img_ratio // q_size_ratio, self.resized_img_ratio // k_size_ratio)
 
-        self.resized_img_size = 20 
-        img_size = (self.resized_img_size, self.resized_img_size)
-        # self.q_downsample = nn.AdaptiveAvgPool2d(img_size)
-        # self.k_downsample = nn.AdaptiveAvgPool2d(img_size)
+        self.q_downsample = nn.AvgPool2d(3, stride=self.scale_factor, padding=1)
+        self.k_downsample = nn.AvgPool2d(3, stride=self.scale_factor, padding=1)
+
+        # if self.scale_factor > 2: 
+        #     raise Exception("Scale factor is bigger than 2 in cross attention!")
+        
+        # if self.scale_factor == 2:
+        #     self.q_downsample = nn.Conv2d(self.dim, self.dim, kernel_size=3, stride=self.scale_factor, padding=1)
+        #     self.k_downsample = nn.Conv2d(self.dim, self.dim, kernel_size=3, stride=self.scale_factor, padding=1)
+        #     self.upsample = nn.ConvTranspose2d(self.dim, self.dim, kernel_size=3, stride=self.scale_factor, padding=1, output_padding=1)
+        # else: 
+        #     self.q_downsample = nn.Identity()
+        #     self.k_downsample = nn.Identity()
+        #     self.upsample = nn.Identity()
+
 
         # self.q_downsample = PSDownsampling(self.dim, self.scale_factor)
         # self.k_downsample = PSDownsampling(self.dim, self.scale_factor)
@@ -511,22 +522,89 @@ class CrossAttentionV2(nn.Module):
         H2, W2 = u1.shape[2:4]
         
         initial_input = u2.clone()
-        u1 = nn.AdaptiveAvgPool2d((H2 // self.scale_factor, W2 // self.scale_factor))(u1)
-        u2 = nn.AdaptiveAvgPool2d((H // self.scale_factor, W // self.scale_factor))(u2)
-        # u1 = self.k_downsample(u1) # u1 -> (B, C, S, S)
-        # u2 = self.q_downsample(u2) # u2 -> (B, C, S, S)
+        # u1 = nn.AdaptiveAvgPool2d((H2 // self.scale_factor, W2 // self.scale_factor))(u1)
+        # u2 = nn.AdaptiveAvgPool2d((H // self.scale_factor, W // self.scale_factor))(u2)
+        u1 = self.k_downsample(u1) # u1 -> (B, C, S, S)
+        u2 = self.q_downsample(u2) # u2 -> (B, C, S, S)
+        resized_img_size = u2.shape[2:4]
         u1 = u1.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
         u2 = u2.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
         # u1=u2 -> (B, S*S, C)
 
         y = self.attention(q=u2, k=u1, v=u1) # y -> (B, S*S, C)
-        y = y.transpose(1, 2).contiguous().view(B, C, H // self.scale_factor, W // self.scale_factor) # y -> (B, C, S, S)
+        y = y.transpose(1, 2).contiguous().view(B, C, *resized_img_size) # y -> (B, C, S, S)
 
         y = nn.Upsample(size=(H, W), mode="bilinear")(y)
         # y = self.upsample(y) # y -> (B, C, H, W) 
         y += initial_input
 
         return y
+
+
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, c1, reduction=16):
+        super(ChannelAttentionModule, self).__init__()
+        mid_channel = c1 // reduction
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.shared_MLP = nn.Sequential(
+            nn.Linear(in_features=c1, out_features=mid_channel),
+            nn.ReLU(),
+            nn.Linear(in_features=mid_channel, out_features=c1)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avgout = self.shared_MLP(self.avg_pool(x).view(x.size(0),-1)).unsqueeze(2).unsqueeze(3)
+        maxout = self.shared_MLP(self.max_pool(x).view(x.size(0),-1)).unsqueeze(2).unsqueeze(3)
+        return self.sigmoid(avgout + maxout)
+
+
+class SpatialAttentionModule(nn.Module):
+    def __init__(self):
+        super(SpatialAttentionModule, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3) 
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.sigmoid(self.conv2d(out))
+        return out
+
+
+class CBAM(nn.Module):
+    def __init__(self, c1, c2):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttentionModule(c1)
+        self.spatial_attention = SpatialAttentionModule()
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+
+
+class CBAMCrossAttn(nn.Module):
+    def __init__(self, dim, q_size_ratio, k_size_ratio):
+        super(CBAMCrossAttn, self).__init__()
+        self.channel_attention = ChannelAttentionModule(dim)
+        self.spatial_attention = SpatialAttentionModule()
+        self.cross_attn = CrossAttentionV2(dim, q_size_ratio, k_size_ratio)
+
+    def forward(self, x):   
+        u1, u2 = x
+        if u1.shape[0] > u2.shape[0]: 
+            # u1 is the spatial_informative_feature and u2 is the abstract_informative_feature 
+            u1 = self.spatial_attention(u1) * u1
+            u2 = self.channel_attention(u2) * u2
+        else: 
+            # u1 is the abstract_informative_feature and u2 is the spatial_informative_feature 
+            u1 = self.channel_attention(u1) * u1
+            u2 = self.spatial_attention(u2) * u2
+        res = self.cross_attn([u1, u2])
+        return res
 
 
 class DetectMultiBackend(nn.Module):
