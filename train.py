@@ -221,7 +221,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        single_cls,
                                        hyp=hyp,
                                        cache=None if noval else opt.cache,
-                                       rect=True,
+                                       rect=opt.rect,
                                        rank=-1,
                                        workers=workers * 2,
                                        pad=0.5,
@@ -356,17 +356,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = validate.run(data_dict,
-                                                batch_size=batch_size // WORLD_SIZE * 2,
-                                                imgsz=imgsz,
-                                                half=amp,
-                                                model=ema.ema,
-                                                single_cls=single_cls,
-                                                dataloader=val_loader,
-                                                save_dir=save_dir,
-                                                plots=False,
-                                                callbacks=callbacks,
-                                                compute_loss=compute_loss)
+                with torch.cuda.amp.autocast(amp):
+                    results, maps, _ = validate.run(data_dict,
+                                                    batch_size=batch_size // WORLD_SIZE * 2,
+                                                    imgsz=imgsz,
+                                                    half=amp,
+                                                    model=ema.ema,
+                                                    single_cls=single_cls,
+                                                    dataloader=val_loader,
+                                                    save_dir=save_dir,
+                                                    plots=False,
+                                                    callbacks=callbacks,
+                                                    compute_loss=compute_loss)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
